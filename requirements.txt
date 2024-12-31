@@ -13,3 +13,4 @@ scikit-learn
 python-dotenv
 langchain-google-genai>=0.0.5
 langchain-groq>=0.0.5
+langchain-community>=0.0.1
