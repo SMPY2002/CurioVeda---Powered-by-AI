@@ -1,0 +1,4 @@
+# adding .env file to gitignore
+.env
+# adding app_logs.log file to gitignore
+app_logs.log
