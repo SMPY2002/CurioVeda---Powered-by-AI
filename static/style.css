@@ -92,11 +92,12 @@ body {
 
 /* Hero Section */
 .section {
-    background-size: cover;
+    background-size: contain;
     padding: 50px;
     text-align: center;
     color: Yellow;
     border-radius: 10px;
+    min-height: 450px;
     height: 450px;
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
     background-position: center;
@@ -175,12 +176,16 @@ body {
     }
 
     .section h1 {
-        font-size: 2rem;
+        visibility: hidden; 
+        height: 0; 
+        margin: 0; 
+        padding: 0; 
     }
 
     .section {
+        background-size: contain;
         padding: 30px;
-        height: auto;
+        min-height: auto; 
         margin-top: 20px;
     }
 }
