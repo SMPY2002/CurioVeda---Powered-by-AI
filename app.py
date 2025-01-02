@@ -492,10 +492,6 @@ with st.container():
                     with st.spinner("Scraping the website..."):
                         st.session_state.scraped_data[url] = scrape_url(url)
             st.success("Scraping completed!")
-            st.write("#### Scraped Data:")
-            for url, data in st.session_state.scraped_data.items():
-                st.write(f"URL: {url}")
-                st.write(data[:5000] + "..." if len(data) > 500 else data)
 
         if st.button("Start Learning"):
             with st.spinner("Learning from the Scrapped data..."):
