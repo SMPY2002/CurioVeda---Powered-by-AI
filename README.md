@@ -112,4 +112,4 @@ This project is licensed under the [MIT License](LICENSE). Feel free to use, mod
 ## Contact
 For any queries or suggestions, please reach out via:
 - Email: <smpy1405@gmail.com>
-- GitHub: [SMPY2002](https://github.com/SMPY2002)
+- LinkedIn: [Shivam Pandey](https://www.linkedin.com/in/shivam-pandey1405)
