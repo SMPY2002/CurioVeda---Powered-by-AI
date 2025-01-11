@@ -594,4 +594,4 @@ with st.container():
  
 
 # Footer Section
-st.markdown("<div class='footer'>© 2024 QueryHub. All Rights Reserved.</div>", unsafe_allow_html=True)
+st.markdown("<div class='footer'>© 2024-25 CurioVeda. All Rights Reserved.</div>", unsafe_allow_html=True)
