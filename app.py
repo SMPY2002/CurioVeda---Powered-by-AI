@@ -1,3 +1,9 @@
+from gtts import gTTS
+import tempfile
+import base64
+import uuid
+import streamlit.components.v1 as components
+
 import streamlit as st
 import requests
 from requests.exceptions import RequestException
@@ -18,12 +24,21 @@ import os
 from boilerpy3 import extractors
 import pytesseract
 from PIL import Image
+import io
 from io import BytesIO
 import re
 import time
 import plotly.express as px
 import pandas as pd
 import base64
+
+# other python file import------------------------
+from graph_ai import query_llm_for_chart_data
+from graph_ai import query_llm_for_chart_summary
+# ------------------------------------------------
+# -----------
+# Render chart dynamically
+import plotly.express as px
 
 
 load_dotenv()
@@ -33,24 +48,57 @@ groq_api_key = os.getenv('GROQ_API_KEY')
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
 
+# Session state init
+for key, default in {
+    "urls": [], "scraped_data": {}, "vector_store": None, "chat_history": [],
+    "greeting_shown": False, "visualization_candidate_data": None,
+    "show_visualize_prompt": False, "popup_open": False
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+if "speak_triggered" not in st.session_state:
+    st.session_state.speak_triggered = False
+
+if "narration_playing" not in st.session_state:
+    st.session_state.narration_playing = False
+
+if "voice_lang" not in st.session_state:
+    st.session_state.voice_lang = "English"
+
+if "narration_state" not in st.session_state:
+    st.session_state.narration_state = "stopped"  # Options: "playing", "paused", "stopped"
+if "audio_base64" not in st.session_state:
+    st.session_state.audio_base64 = ""
+
+
+
 # Initialize session state for URLs and scraped data and Chat History
-if "urls" not in st.session_state:
-    st.session_state.urls = []
+# if "urls" not in st.session_state:
+#     st.session_state.urls = []
 
-if "scraped_data" not in st.session_state:
-    st.session_state.scraped_data = {}
+# if "scraped_data" not in st.session_state:
+#     st.session_state.scraped_data = {}
 
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
+# if "vector_store" not in st.session_state:
+#     st.session_state.vector_store = None
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# if "chat_history" not in st.session_state:
+#     st.session_state.chat_history = []
 
-if "visualization_data" not in st.session_state:
-    st.session_state.visualization_data = {"ready_for_visualization": False, "data": None}
+# if "greeting_shown" not in st.session_state:
+#     st.session_state.greeting_shown = False
 
-if "greeting_shown" not in st.session_state:
-    st.session_state.greeting_shown = False
+# if "visualization_candidate_data" not in st.session_state:
+#     st.session_state.visualization_candidate_data = None
+
+# if "show_visualize_prompt" not in st.session_state:
+#     st.session_state.show_visualize_prompt = False
+
+# if "popup_open" not in st.session_state:
+#     st.session_state.popup_open = False
+
 
 # Greet the user if opening the app for the first time
 if not st.session_state.greeting_shown:
@@ -217,68 +265,88 @@ def enhance_with_headings(headings, text_content):
 
 # <------------------------------------------------------------------>
 
-# Function to detect tabular data in the chatbot response
-def detect_table_in_response(answer):
-    """
-    Detects tables in free-form text, including approximate or inconsistent formats.
-    Handles ranges, numeric/text values, and space-separated tables.
-    """
-    if isinstance(answer, dict) and "text" in answer:
-        response_text = answer["text"]
-    elif isinstance(answer, str):
-        response_text = answer
-    else:
-        return None
-
-    # Try to find tables with simple heuristics
-    table_data = []
-    lines = response_text.split("\n")
+def detect_statistical_data(text):
+    lines = text.strip().split("\n")
+    rows = []
     for line in lines:
-        # Match lines that look like table rows (tab or space-separated data)
-        if re.match(r"^\s*\d{4}(\s+|\t)\S+", line):  # Line starts with a year (e.g., "2014")
-            table_data.append(line.strip())
-
-    if not table_data:
-        return None  # No table-like data found
-
-    # Extract headers (first line before table)
-    headers = ["Year", "Wealth (USD Millions)"]
-    data_rows = []
-
-    for row in table_data:
-        # Split by spaces or tabs
-        parts = re.split(r"\s{2,}|\t", row.strip())  # Use 2+ spaces or tabs as separator
-        if len(parts) >= 2:  # Ensure at least two columns exist
-            year = parts[0]
-            wealth = parts[1]
-
-            # Normalize ranges like "1,500 - 2,000" into averages
-            if "-" in wealth:
-                numbers = [float(n.replace(",", "")) for n in wealth.split("-") if n.strip().replace(",", "").isdigit()]
-                wealth = sum(numbers) / len(numbers) if numbers else None
-            else:
-                wealth = float(wealth.replace(",", "")) if wealth.replace(",", "").isdigit() else None
-
-            data_rows.append([year, wealth])
-
-    # Convert to DataFrame
-    if data_rows:
-        df = pd.DataFrame(data_rows, columns=headers)
-        return df
-
+        parts = re.split(r'\t+|\s{2,}', line.strip())
+        if len(parts) == 2 and re.match(r'^\d{4}$', parts[0]) and parts[1].replace(',', '').replace('.', '').isdigit():
+            rows.append([parts[0], float(parts[1].replace(",", ""))])
+        elif len(parts) >= 3 and re.match(r'^\d{4}$', parts[0]):
+            try:
+                val1 = float(parts[1].replace(",", ""))
+                val2 = float(parts[2].replace(",", "").replace("%", "")) if parts[2] != '-' else None
+                rows.append([parts[0], val1, val2])
+            except: continue
+    if rows:
+        return pd.DataFrame(rows, columns=["Year", "Value"] if len(rows[0]) == 2 else ["Year", "Population (millions)", "Growth Rate (%)"])
     return None
 
-# Function to generate Plotly graphs
-def generate_graph(data, chart_type):
-    if chart_type == "Bar Chart":
-        return px.bar(data, x=data.columns[0], y=data.columns[1], title="Bar Chart")
-    elif chart_type == "Line Chart":
-        return px.line(data, x=data.columns[0], y=data.columns[1], title="Line Chart")
-    elif chart_type == "Pie Chart":
-        return px.pie(data, names=data.columns[0], values=data.columns[1], title="Pie Chart")
-    elif chart_type == "Histogram":
-        return px.histogram(data, x=data.columns[0], title="Histogram")
-    return None
+def speak_text(text, lang_code="en"):
+    tts = gTTS(text=text, lang=lang_code, slow=False)
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.mp3")
+    tts.save(file_path)
+
+    # Base64 encode
+    with open(file_path, "rb") as f:
+        b64_audio = base64.b64encode(f.read()).decode()
+
+    # HTML5 Audio with JS toggle play/pause
+    autoplay_html = f"""
+    <script>
+    var existing = document.getElementById("curioveda_audio");
+    if (existing) {{
+        existing.pause();
+        existing.remove();
+    }}
+
+    var audio = document.createElement("audio");
+    audio.id = "curioveda_audio";
+    audio.src = "data:audio/mp3;base64,{b64_audio}";
+    audio.autoplay = true;
+    document.body.appendChild(audio);
+    </script>
+    """
+
+    components.html(autoplay_html, height=0)
+    os.remove(file_path)
+    st.session_state.narration_playing = True
+
+
+def prepare_audio(text, lang_code="en"):
+    tts = gTTS(text=text, lang=lang_code, slow=False)
+    temp_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.mp3")
+    tts.save(temp_file)
+    with open(temp_file, "rb") as f:
+        audio_bytes = f.read()
+    st.session_state.audio_base64 = base64.b64encode(audio_bytes).decode()
+    os.remove(temp_file)
+
+
+def generate_audio_base64(text, lang_code="en"):
+    tts = gTTS(text=text, lang=lang_code, slow=False)
+    path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.mp3")
+    tts.save(path)
+    with open(path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode()
+    os.remove(path)
+    return encoded
+
+
+def stop_narration():
+    stop_js = """
+    <script>
+    var audio = document.getElementById("curioveda_audio");
+    if (audio) {
+        audio.pause();
+        audio.remove();
+    }
+    </script>
+    """
+    components.html(stop_js, height=0)
+    st.session_state.narration_playing = False
+
 
 # <----------------------------------------------------------------->
 def extract_and_preprocess(documents):
@@ -349,7 +417,7 @@ def query_bot_with_context(question, context):
 
     # Set up the retrieval chain
     retriever = st.session_state.vector_store.as_retriever()
-    llm = ChatGroq(api_key=groq_api_key, model_name="Llama3-8b-8192")
+    llm = ChatGroq(api_key=groq_api_key, model_name="llama3-70b-8192")
 
     # Define a prompt for professional and structured responses
     prompt = ChatPromptTemplate.from_template(
@@ -492,11 +560,14 @@ with st.container():
                     with st.spinner("Scraping the website..."):
                         st.session_state.scraped_data[url] = scrape_url(url)
             st.success("Scraping completed!")
+            # st.write("#### Scraped Data:")
+            # for url, data in st.session_state.scraped_data.items():
+            #     st.write(f"URL: {url}")
+            #     st.write(data[:5000] + "..." if len(data) > 500 else data)
 
         if st.button("Start Learning"):
             with st.spinner("Learning from the Scrapped data..."):
                 create_vector_store()
-
         else:
             st.warning("No vector embeddings available. Please scrape and process content first.")
 
@@ -516,82 +587,281 @@ with st.container():
             st.session_state.scraped_data = {}
             st.session_state.vector_store = None
             st.success("All data cleared.")
+            st.rerun()
 
     # Right Section: Chatbot Interface
     with right_section:
         st.markdown('<h3 class="center-text">Chatbot</h3>', unsafe_allow_html=True)
+        # Visualization mode toggle
+        # st.markdown("<div style='text-align: right;'>", unsafe_allow_html=True)
+        # st.session_state.visual_mode = st.toggle("🖼️ Enable CurioVeda Visualization Mode", value=False)
+        # st.markdown("</div>", unsafe_allow_html=True)
 
-        # User input question
-        user_question = st.text_input("Ask a question:", placeholder="Type your question here...")
+        # === Voice Language Selection aligned with toggle ===
+        lang_toggle_col, voice_lang_col = st.columns([7, 1.5])  # Adjust width to match your toggle size
+        with lang_toggle_col:
+            st.markdown("<div style='text-align: right; margin-top: 30px;'>", unsafe_allow_html=True)
+            st.session_state.visual_mode = st.toggle("🖼️ Enable CurioVeda Visualization Mode", value=st.session_state.get("visual_mode", False), key="visual_mode_toggle")
+            st.markdown("</div>", unsafe_allow_html=True)
+        # Voice language selection
+        with voice_lang_col:
+            lang_map = {
+                "English": "en",
+                "Hindi (हिंदी)": "hi",
+                "Gujarati (ગુજરાતી)": "gu",
+                "Marathi (मराठी)": "mr",
+                "Tamil (தமிழ்)": "ta"
+            }
+
+            selected_lang = st.selectbox(
+                "🎙️ Voice Language",
+                options=list(lang_map.keys()),
+                index=list(lang_map.keys()).index(st.session_state.get("voice_lang", "English")),
+                key="voice_lang_select",
+            )
+
+            st.session_state.voice_lang = selected_lang
+
+        # === Modern Chat Input with Speaker Icon and Language Control ===
+        # Chat input and speaker button in the same row
+        chat_col, icon_col, btn_col2 = st.columns([10, 1, 1.5])  # Adjust width ratio as needed
+
+        with chat_col:
+            user_question = st.text_input(
+                "Ask a question:",
+                placeholder="Type your question here...",
+                label_visibility="collapsed",
+                key="chat_input"
+            )
+
+        # === Voice Playback Controls: Play/Pause/Resume and Conditional Stop ===
+        with icon_col:
+            icon_map = {
+                "stopped": "▶️",
+                "playing": "⏸️",
+                "paused": "🔁"
+            }
+            tooltip_map = {
+                "stopped": "Play narration",
+                "playing": "Pause narration",
+                "paused": "Resume narration"
+            }
+
+            icon = icon_map[st.session_state.narration_state]
+            tooltip = tooltip_map[st.session_state.narration_state]
+
+            if st.button(icon, key="voice_control", help=tooltip):
+                if st.session_state.narration_state == "stopped":
+                    if st.session_state.chat_history:
+                        answer = st.session_state.chat_history[0]["answer"]
+                        lang_code = lang_map[st.session_state.voice_lang]
+                        st.session_state.audio_base64 = generate_audio_base64(answer, lang_code)
+                        st.session_state.narration_state = "playing"
+                elif st.session_state.narration_state == "playing":
+                    st.session_state.narration_state = "paused"
+                elif st.session_state.narration_state == "paused":
+                    st.session_state.narration_state = "playing"
+
+        with btn_col2:
+            if st.session_state.narration_state in ["playing", "paused"]:
+                if st.button("🛑 Stop", help="Click to stop the ongoing narration."):
+                    st.session_state.audio_base64 = ""
+                    st.session_state.narration_state = "stopped"
+
+
         if user_question:
-            if user_question.strip():
-                context = "\n".join(
-                    [f"User: {entry['question']}\nBot: {entry['answer']}" for entry in st.session_state.chat_history]
-                )
-                context += f"\nUser: {user_question}"
+            context = "\n".join([f"User: {c['question']}\nBot: {c['answer']}" for c in st.session_state.chat_history]) + f"\nUser: {user_question}"
+            a = query_bot_with_context(user_question, context)
+            # Prevent duplicate chat entries
+            if not st.session_state.chat_history or st.session_state.chat_history[0].get("question") != user_question:
+                st.session_state.chat_history.insert(0, {"question": user_question, "answer": a["text"]})
 
-                answer = query_bot_with_context(user_question, context)
-
-                if answer:
-                    st.session_state.chat_history.insert(0, {"question": user_question, "answer": answer})
-
-                    st.write(f"**CurioVeda:** {answer['text'] if isinstance(answer, dict) else answer}")
-
-                    table_data = detect_table_in_response(answer)
-                    if table_data is not None:
-                        st.write("### Data Table")
-                        st.dataframe(table_data)
-                        st.session_state.visualization_data = {"ready_for_visualization": True, "data": table_data}
-                    else:
-                        st.session_state.visualization_data = {"ready_for_visualization": False, "data": None}
-                else:
-                    st.write("**CurioVeda:** Hmm, I couldn't find that in the knowledge base.")
-            else:
-                st.warning("Please enter a question.")
-
-        # Display chat history
-        st.write("#### Chat History")
         if st.session_state.chat_history:
-            for chat in st.session_state.chat_history[1:]:
-                st.markdown(f"**You:** {chat['question']}")
-                st.markdown(f"**CurioVeda:** {chat['answer']}")
-        else:
-            st.info("Start asking questions to see the chat history!")
+            qa_pair = st.session_state.chat_history[0]
+            st.markdown(f"**CurioVeda:** {qa_pair['answer']}")
 
-        # Visualization Section
-        if st.session_state.visualization_data["ready_for_visualization"]:
-            st.write("### Generate Visualization")
-            data = st.session_state.visualization_data["data"]
+            # Speak response if icon clicked
+            if st.session_state.speak_triggered:
+                speak_text(qa_pair["answer"], lang_code=lang_map[st.session_state.voice_lang])
+                st.session_state.speak_triggered = False  # reset
 
-            # Button state management
-            if "selected_chart" not in st.session_state:
-                st.session_state.selected_chart = None
+            if st.session_state.audio_base64:
+                js_control = {
+                    "playing": "audio.play();",
+                    "paused": "audio.pause();",
+                    "stopped": "audio.pause(); audio.currentTime = 0;"
+                }[st.session_state.narration_state]
 
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                if st.button("Bar Chart"):
-                    st.session_state.selected_chart = "Bar Chart"
-            with col2:
-                if st.button("Line Chart"):
-                    st.session_state.selected_chart = "Line Chart"
-            with col3:
-                if st.button("Pie Chart"):
-                    st.session_state.selected_chart = "Pie Chart"
-            with col4:
-                if st.button("Histogram"):
-                    st.session_state.selected_chart = "Histogram"
+                audio_html = f"""
+                <audio id="curio_audio" src="data:audio/mp3;base64,{st.session_state.audio_base64}" style="display:none"></audio>
+                <script>
+                var audio = document.getElementById("curio_audio");
+                if (audio) {{
+                    {js_control}
+                }}
+                </script>
+                """
+                components.html(audio_html, height=0)
 
-            # Generate and display the chart
-            if st.session_state.selected_chart and data is not None:
-                chart = generate_graph(data, st.session_state.selected_chart)
-                st.plotly_chart(chart)
 
-        # Clear Chat History
+            # Show visualization button if enabled and chartable data found
+            if st.session_state.visual_mode:
+                chart_result = query_llm_for_chart_data(qa_pair["answer"])
+                if chart_result:
+                    st.session_state.chart_data = chart_result
+                    if st.button("📊 Visualize this Data", key="show_chart_button"):
+                        st.session_state.show_viz_panel = True
+
+            # Render Visualization Panel popup only if toggled ON and user clicked visualize
+            if st.session_state.visual_mode and st.session_state.get("show_viz_panel", False):
+                
+                # Inject CSS styles once
+                st.markdown("""
+                    <style>
+                        .viz-popup-box {
+                            position: fixed;
+                            top: 50%;
+                            left: 50%;
+                            transform: translate(-50%, -50%);
+                            z-index: 999;
+                            background-color: #ffffff;
+                            max-width: 750px;
+                            width: 90%;
+                            padding: 25px;
+                            border-radius: 12px;
+                            border: 2px solid #c3d3e3;
+                            box-shadow: 0 0 40px rgba(0, 0, 0, 0.2);
+                            animation: fadeIn 0.4s ease-in-out;
+                        }
+                        .popup-container {
+                            display: flex;
+                            justify-content: center;
+                        }
+                    </style>
+                """, unsafe_allow_html=True)
+
+                # Use columns to center content
+                with st.container():
+                    # st.markdown("<div class='popup-container'><div class='viz-popup-box'>", unsafe_allow_html=True)
+                    st.markdown(f"<h3 style='text-align: center; color: red;'>CurioVeda Visualization</h3>", unsafe_allow_html=True)
+                    # Close button in the top-right corner
+                    close_btn_col = st.columns([0.9, 0.1])[1]
+                    with close_btn_col:
+                        if st.button("❌", key="close_popup"):
+                            st.session_state.show_viz_panel = False
+                            st.rerun()
+
+                    chart_data = st.session_state.chart_data
+                    df = chart_data["df"]
+                    title = chart_data["title"]
+                    recommended = chart_data["chart_type"]
+                    chart_explanations = {
+                        "bar": "Best for comparing quantities across categories.",
+                        "line": "Ideal for trends over time.",
+                        "pie": "Great for showing proportional shares.",
+                        "histogram": "Used to show frequency distribution.",
+                        "scatter3d": "Shows relationship among 3 continuous variables."
+                    }
+                    st.markdown(f"<h6 style='color: green;'>Recommended Chart Type: {recommended}</h6>", unsafe_allow_html=True)
+                    st.markdown(f"🧠 **Why this chart?** {chart_explanations.get(recommended, '')}")
+                    # st.markdown("### Select Chart Type")
+                    # Chart type selection
+                    chart_types = {
+                        "📊 Bar": "bar",
+                        "📈 Line": "line",
+                        "🧩 Pie": "pie",
+                        "📉 Histogram": "histogram",
+                        "🌐 3D Scatter": "scatter3d"
+                    }
+                    # Default column selection for recommended chart
+                    default_cols = list(df.columns[:3]) if len(df.columns) >= 3 else list(df.columns)
+
+                    chart_placeholder = st.empty()
+
+                    def render_recommended_chart():
+                        fig = None
+                        if recommended in ["bar", "line", "histogram"]:
+                            if len(default_cols) >= 2:
+                                x, y = default_cols[0], default_cols[1]
+                                if recommended == "bar":
+                                    fig = px.bar(df, x=x, y=y, title=title)
+                                elif recommended == "line":
+                                    fig = px.line(df, x=x, y=y, title=title)
+                                elif recommended == "histogram":
+                                    fig = px.histogram(df, x=y, title=title)
+                        elif recommended == "pie":
+                            if len(default_cols) >= 2:
+                                fig = px.pie(df, names=default_cols[0], values=default_cols[1], title=title)
+                        elif recommended == "scatter3d":
+                            if len(default_cols) >= 3:
+                                import plotly.graph_objects as go
+                                fig = go.Figure(data=[go.Scatter3d(
+                                    x=df[default_cols[0]],
+                                    y=df[default_cols[1]],
+                                    z=df[default_cols[2]],
+                                    mode='markers',
+                                    marker=dict(size=6, color=df[default_cols[2]], colorscale='Viridis', opacity=0.8)
+                                )])
+                                fig.update_layout(title=title)
+                        if fig:
+                            chart_placeholder.plotly_chart(fig, use_container_width=True, key="recommended_chart_main" if 'from_reset' not in st.session_state else "recommended_chart_reset")
+
+
+                    render_recommended_chart()
+
+                    # Allow user to update manually (expandable)
+                    with st.expander("🔧 Column Selection for Custom Visualization"):
+                        chart_label = st.selectbox("Choose Chart Type", list(chart_types.keys()), index=list(chart_types.values()).index(recommended))
+                        chart_type = chart_types[chart_label]
+
+                        selected_cols = st.multiselect("Select Columns to Visualize", options=list(df.columns), default=default_cols[:3])
+
+                        if st.button("🔁 Reset to Recommended", key="reset_to_recommended"):
+                            st.session_state.from_reset = True
+                            render_recommended_chart()
+                            st.session_state.from_reset = False
+                        else:
+                            fig = None
+                            if chart_type in ["bar", "line", "histogram"]:
+                                if len(selected_cols) >= 2:
+                                    x, y = selected_cols[0], selected_cols[1]
+                                    if chart_type == "bar":
+                                        fig = px.bar(df, x=x, y=y, title=title)
+                                    elif chart_type == "line":
+                                        fig = px.line(df, x=x, y=y, title=title)
+                                    elif chart_type == "histogram":
+                                        fig = px.histogram(df, x=y, title=title)
+                            elif chart_type == "pie":
+                                if len(selected_cols) >= 2:
+                                    fig = px.pie(df, names=selected_cols[0], values=selected_cols[1], title=title)
+                            elif chart_type == "scatter3d":
+                                if len(selected_cols) >= 3:
+                                    import plotly.graph_objects as go
+                                    fig = go.Figure(data=[go.Scatter3d(
+                                        x=df[selected_cols[0]],
+                                        y=df[selected_cols[1]],
+                                        z=df[selected_cols[2]],
+                                        mode='markers',
+                                        marker=dict(size=6, color=df[selected_cols[2]], colorscale='Viridis', opacity=0.8)
+                                    )])
+                                    fig.update_layout(title=title)
+
+                            if fig:
+                                chart_placeholder.plotly_chart(fig, use_container_width=True, key="custom_chart")
+                            else:
+                                st.warning("Please select enough columns to render this chart type.")
+
+                    st.markdown("</div></div>", unsafe_allow_html=True)
+
+        st.markdown("#### Chat History")
+        for item in st.session_state.chat_history[1:]:
+            st.markdown(f"**You:** {item['question']}")
+            st.markdown(f"**CurioVeda:** {item['answer']}")
+
         if st.button("Clear Chat History"):
-            st.session_state.chat_history = []
-            st.session_state.visualization_data = {"ready_for_visualization": False, "data": None}
+            st.session_state.chat_history.clear()
             st.success("Chat history cleared.")
- 
+            st.rerun()
 
 # Footer Section
-st.markdown("<div class='footer'>© 2024-25 CurioVeda. All Rights Reserved.</div>", unsafe_allow_html=True)
+st.markdown("<div class='footer'>© 2024 QueryHub. All Rights Reserved.</div>", unsafe_allow_html=True)
