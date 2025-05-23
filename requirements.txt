@@ -14,3 +14,4 @@ python-dotenv
 langchain-google-genai>=0.0.5
 langchain-groq>=0.0.5
 langchain-community>=0.0.1
+gTTS==2.5.4
